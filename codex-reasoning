@@ -1,0 +1,546 @@
+#!/usr/bin/env python3
+"""Show active Codex agents and, with -a, recent saved reasoning summaries.
+
+A standalone, read-only tool for local Codex rollout logs. Requires Python 3.9+
+and only the standard library. The JSONL format is internal to Codex and may
+change; reasoning text comes only from saved summary_text items.
+"""
+
+import argparse
+from datetime import datetime, timedelta, timezone
+import json
+import math
+import ntpath
+import os
+from pathlib import Path
+import re
+import shutil
+import sys
+import textwrap
+import unicodedata
+
+
+VERSION = '1.4.1'
+UTC = timezone.utc
+TOKEN_FIELDS = ('input_tokens', 'cached_input_tokens', 'cache_write_input_tokens',
+                'output_tokens', 'reasoning_output_tokens', 'total_tokens')
+ANSI_ESCAPE = re.compile(r'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-_])')
+BIDI_CONTROLS = frozenset('\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e'
+                          '\u2066\u2067\u2068\u2069\u206a\u206b\u206c\u206d\u206e\u206f')
+
+
+def terminal_width():
+    return max(20, min(100, shutil.get_terminal_size(fallback=(80, 24)).columns - 1))
+
+
+def safe_text(text):
+    """Keep log content from controlling the terminal, including bidi controls."""
+    text = ANSI_ESCAPE.sub('', text).replace('\r\n', '\n').replace('\r', '\n')
+    text = text.expandtabs(4)
+    return ''.join('\ufffd' if unicodedata.category(char) == 'Cs' else char
+                   for char in text
+                   if char == '\n' or (unicodedata.category(char) != 'Cc'
+                                       and char not in BIDI_CONTROLS))
+
+
+def parse_timestamp(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        when = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=UTC)
+        return when.astimezone(UTC)
+    except (ValueError, OverflowError):
+        return None
+
+
+def age_label(timestamp, now):
+    seconds = max(0, int((now - timestamp).total_seconds()))
+    if seconds < 60:
+        return f'{seconds}s ago'
+    if seconds < 3600:
+        return f'{seconds // 60}m ago'
+    if seconds < 86400:
+        return f'{seconds // 3600}h ago'
+    return f'{seconds // 86400}d ago'
+
+
+def clock_label(when):
+    try:
+        return when.astimezone().strftime('%H:%M:%S')
+    except (OverflowError, ValueError, OSError):
+        return when.strftime('%H:%M:%S UTC')
+
+
+def as_dict(value):
+    return value if isinstance(value, dict) else {}
+
+
+def string_fields(value, names):
+    return {key: item for key, item in as_dict(value).items()
+            if key in names and isinstance(item, str) and item.strip()}
+
+
+def token_counts(value):
+    return {key: count for key, count in as_dict(value).items()
+            if key in TOKEN_FIELDS and type(count) is int and count >= 0}
+
+
+def record_event(details, payload, timestamp, turn_order):
+    """Keep recorded activity and usage; a start event does not prove liveness."""
+    states = {'task_started': 'started', 'task_complete': 'completed', 'turn_aborted': 'aborted'}
+    kind = payload.get('type')
+    if isinstance(kind, str) and kind in states:
+        turn_id = string_fields(payload, ('turn_id',)).get('turn_id')
+        if not turn_id:
+            return
+        turn_order.setdefault(turn_id, len(turn_order))
+        if turn_order[turn_id] != len(turn_order) - 1:
+            return  # Ignore older turns, but accept a new turn with a missing start.
+        activity = dict(turn_id=turn_id, state=states[kind])
+        if timestamp is not None:
+            activity['timestamp'] = timestamp.isoformat().replace('+00:00', 'Z')
+        duration = payload.get('duration_ms')
+        if type(duration) is int and duration >= 0:
+            activity['duration_ms'] = duration
+        if kind == 'turn_aborted':
+            activity.update(string_fields(payload, ('reason',)))
+        details['last_turn'] = activity
+    elif kind == 'token_count':
+        info = as_dict(payload.get('info'))
+        usage = {}
+        for source, target in (('last_token_usage', 'last_request'), ('total_token_usage', 'total')):
+            counts = token_counts(info.get(source))
+            if counts:
+                usage[target] = counts
+        window = info.get('model_context_window')
+        if type(window) is int and window > 0:
+            usage['context_window'] = window
+        if usage:
+            if timestamp is not None:
+                usage['timestamp'] = timestamp.isoformat().replace('+00:00', 'Z')
+            details['token_usage'] = usage
+
+
+def read_summary(path):
+    """Read a live UTF-8 rollout, retaining its last usable summary record."""
+    metadata, latest, timestamp = {}, [], None
+    details, context, turn_order = {}, {}, {}
+    with path.open('rb') as stream:
+        for line in stream:
+            try:
+                record = json.loads(line.decode('utf-8'))
+            except (ValueError, UnicodeError, RecursionError):
+                continue  # Live logs can end with an incomplete JSON/UTF-8 line.
+            if not isinstance(record, dict):
+                continue
+            payload = record.get('payload')
+            if not isinstance(payload, dict):
+                continue
+            if record.get('type') == 'session_meta':
+                started_at = parse_timestamp(record.get('timestamp'))
+                if started_at is not None:
+                    metadata.setdefault('session_started_at', started_at)
+                source = payload.get('source')
+                spawn = as_dict(as_dict(as_dict(source).get('subagent')).get('thread_spawn'))
+                identity = string_fields(spawn, ('agent_nickname', 'agent_path',
+                                                 'parent_thread_id', 'agent_role'))
+                identity.update(string_fields(payload, ('agent_nickname', 'agent_path',
+                                                        'parent_thread_id', 'agent_role')))
+                metadata.update(string_fields(payload, ('id', 'cwd')))
+                if 'agent_nickname' in identity:
+                    metadata['agent_nickname'] = identity.pop('agent_nickname')
+                details.update(identity)
+                details.update(string_fields(payload, ('model_provider', 'cli_version')))
+                source_name = source if isinstance(source, str) else payload.get('thread_source')
+                if not (isinstance(source_name, str) and source_name.strip()) and spawn:
+                    source_name = 'subagent'
+                details.update(string_fields({'source': source_name}, ('source',)))
+                branch = string_fields(payload.get('git'), ('branch',)).get('branch')
+                if branch:
+                    details.setdefault('git_branch_at_start', branch)
+            elif record.get('type') == 'turn_context':
+                current = string_fields(payload, ('turn_id', 'model', 'cwd'))
+                if 'turn_id' in current:
+                    turn_order.setdefault(current['turn_id'], len(turn_order))
+                effort = string_fields(payload, ('effort',)).get('effort')
+                if effort:
+                    current['reasoning_effort'] = effort
+                current.update(string_fields(payload.get('collaboration_mode'), ('mode',)))
+                if current.get('turn_id') and current.get('turn_id') == context.get('turn_id'):
+                    context.update(current)
+                else:
+                    context = current
+            elif record.get('type') == 'event_msg':
+                if payload.get('type') == 'task_started':
+                    started = string_fields(payload, ('turn_id',))
+                    if not started or started.get('turn_id') != context.get('turn_id'):
+                        context = started
+                record_event(details, payload, parse_timestamp(record.get('timestamp')), turn_order)
+            if record.get('type') != 'response_item' or payload.get('type') != 'reasoning':
+                continue
+            summary = payload.get('summary')
+            if not isinstance(summary, list):
+                continue
+            texts = [item['text'] for item in summary
+                     if isinstance(item, dict) and item.get('type') == 'summary_text'
+                     and isinstance(item.get('text'), str) and item['text'].strip()]
+            when = parse_timestamp(record.get('timestamp'))
+            if texts and when is not None:
+                latest, timestamp = texts, when
+                if context:
+                    details['summary_context'] = context.copy()
+                else:
+                    details.pop('summary_context', None)
+    metadata['details'] = details
+    if context:
+        details['current_context'] = context.copy()
+    if details.get('summary_context', {}).get('cwd'):
+        metadata['cwd'] = details['summary_context']['cwd']
+    return metadata, latest, timestamp
+
+
+def collect_sessions(root, cutoff):
+    """Scan recently written rollouts, including agents without summaries."""
+    if not root.is_dir():
+        raise OSError(f'sessions directory not found or not a directory: {root}')
+    sessions = []
+    unreadable = 0
+
+    def walk_error(error):
+        raise error
+
+    for directory, _, files in os.walk(root, onerror=walk_error):
+        for name in files:
+            if not (name.startswith('rollout-') and name.endswith('.jsonl')):
+                continue
+            path = Path(directory) / name
+            try:
+                # An unmatched start alone is not proof of liveness; require
+                # recent log activity so abandoned rollouts eventually vanish.
+                activity_at = datetime.fromtimestamp(path.stat().st_mtime, UTC)
+                if activity_at < cutoff:
+                    continue
+                metadata, texts, when = read_summary(path)
+            except FileNotFoundError:
+                continue  # A session can be moved or deleted while we scan.
+            except OSError:
+                unreadable += 1
+                continue
+            active = metadata['details'].get('last_turn', {}).get('state') == 'started'
+            metadata['active'] = active
+            metadata['activity_timestamp'] = activity_at.isoformat().replace('+00:00', 'Z')
+            metadata['summary_timestamp'] = (when.isoformat().replace('+00:00', 'Z')
+                                             if texts and when is not None else None)
+            if active and metadata['details'].get('current_context', {}).get('cwd'):
+                metadata['cwd'] = metadata['details']['current_context']['cwd']
+            sessions.append((activity_at if active else when or activity_at,
+                             path, metadata, texts))
+    if unreadable:
+        print(f'codex-reasoning: skipped {unreadable} unreadable rollout file(s)', file=sys.stderr)
+    sessions.sort(key=lambda item: (item[0], str(item[1])), reverse=True)
+    return sessions
+
+
+def session_id(session):
+    return session[2].get('id') or session[1].stem
+
+
+def session_tree(sessions, available, include_ancestors=True):
+    """Yield a forest, adding ancestor headings around the selected sessions."""
+    lookup = {}
+    for session in available:
+        lookup.setdefault(session_id(session), session)
+    selected = {session_id(session) for session in sessions}
+    parents = {}
+    for session in sessions:
+        node = session_id(session)
+        trail = set()
+        while node not in parents:
+            trail.add(node)
+            row = lookup.get(node)
+            parent = row[2]['details'].get('parent_thread_id') if row else None
+            if not include_ancestors and parent not in selected:
+                parent = None
+            parents[node] = None if parent in trail else parent
+            node = parents[node]
+            if node is None:
+                break
+    children = {}
+    for node, parent in parents.items():
+        children.setdefault(parent, []).append(node)
+    earliest = datetime.min.replace(tzinfo=UTC)
+    for siblings in children.values():
+        # Session creation time stays fixed while activity updates the logs.
+        siblings.sort(key=lambda node: (
+            lookup[node][2].get('session_started_at', earliest)
+            if node in lookup else earliest, node), reverse=True)
+    stack = [(node, ()) for node in reversed(children.get(None, []))]
+    while stack:
+        node, branches = stack.pop()
+        siblings = children.get(node, [])
+        yield node, lookup.get(node), node in selected, branches, bool(siblings)
+        for index in range(len(siblings) - 1, -1, -1):
+            stack.append((siblings[index], branches + (index == len(siblings) - 1,)))
+
+
+def select_sessions(available, cutoff, count, show_all=False):
+    """Keep active agents; optionally add recent finished sessions."""
+    unique = {}
+    for session in available:
+        unique.setdefault(session_id(session), session)
+    active, recent = [], []
+    for session in unique.values():
+        _, _, metadata, texts = session
+        if metadata['active']:
+            active.append(session)
+        elif show_all and texts:
+            summary_when = parse_timestamp(metadata['summary_timestamp'])
+            if summary_when is not None and summary_when >= cutoff:
+                recent.append(session)
+    selected = active + recent[:count]
+    selected.sort(key=lambda item: (item[0], str(item[1])), reverse=True)
+    return selected
+
+
+def tree_prefixes(branches, width, has_children=False):
+    """Keep room for text on narrow screens; label elided levels explicitly."""
+    try:
+        '│├└─'.encode(getattr(sys.stdout, 'encoding', None) or 'utf-8')
+        vertical, fork, corner = '│   ', '├── ', '└── '
+    except (UnicodeEncodeError, LookupError):
+        vertical, fork, corner = '|   ', '|-- ', '`-- '
+    depth = len(branches)
+    levels = (width - 12) // 4
+    elided = depth > levels
+    visible = branches[-(levels - 1):] if elided else branches
+    prefix = '... ' if elided else ''
+    prefix += ''.join('    ' if last else vertical for last in visible[:-1])
+    if not visible:
+        if has_children:
+            return '', vertical, False, ''
+        return '', '', False, ''
+    heading = prefix + (corner if visible[-1] else fork)
+    content = prefix + ('    ' if visible[-1] else vertical)
+    connector = (prefix + vertical).rstrip()
+    return heading, content, elided, connector
+
+
+def render_details(details, width, expanded, prefix='', active=False):
+    context = details.get('current_context' if active else 'summary_context', {})
+    lines = []
+    if expanded:
+        lines.append([f'task {details["agent_path"]}' if 'agent_path' in details else None,
+                      f'parent [{details["parent_thread_id"][-8:]}]' if 'parent_thread_id' in details else None,
+                      f'role {details["agent_role"]}' if 'agent_role' in details else None])
+        turn = details.get('last_turn', {})
+        event_time = parse_timestamp(turn.get('timestamp'))
+        lines.append([f'last turn event: {turn["state"]}' if 'state' in turn else None,
+                      turn.get('reason'),
+                      f'at {clock_label(event_time)}' if event_time is not None else None,
+                      f'duration {turn["duration_ms"] // 1000}s' if 'duration_ms' in turn else None])
+        lines.append([f'mode {context["mode"]}' if 'mode' in context else None,
+                      f'source {details["source"]}' if 'source' in details else None,
+                      f'Codex {details["cli_version"]}' if 'cli_version' in details else None,
+                      f'branch at start: {details["git_branch_at_start"]}' if 'git_branch_at_start' in details else None])
+        usage = details.get('token_usage', {})
+        counts = usage.get('last_request', {})
+        labels = (('input_tokens', 'input'), ('cached_input_tokens', 'cached input'),
+                  ('output_tokens', 'output'), ('reasoning_output_tokens', 'reasoning output'))
+        tokens = [f'{counts[key]:,} {label}' for key, label in labels if key in counts]
+        if tokens:
+            lines.append(['last request tokens: ' + ', '.join(tokens)])
+        total = usage.get('total', {}).get('total_tokens')
+        lines.append([f'reported total tokens: {total:,}' if total is not None else None,
+                      f'context window: {usage["context_window"]:,}' if 'context_window' in usage else None])
+    for parts in lines:
+        line = ' | '.join(part for part in parts if part)
+        if line:
+            print(textwrap.fill(safe_text(line), width=width,
+                                initial_indent=prefix + '  ', subsequent_indent=prefix + '  '))
+
+
+def render_text(sessions, now, max_age, width, expanded=False, available=None, show_all=False):
+    title = 'Codex agents and reasoning' if show_all else 'Active Codex agents'
+    print(textwrap.fill(f'{title} | {clock_label(now)}', width=width))
+    if not sessions:
+        message = (f'No active agents or reasoning summaries in the last {max_age:g} minutes.'
+                   if show_all else f'No active agents with log activity in the last {max_age:g} minutes.')
+        print('\n' + textwrap.fill(message, width=width))
+        return
+    index = 0
+    for node, row, selected, branches, has_children in session_tree(
+            sessions, available or sessions, include_ancestors=show_all):
+        heading_prefix, prefix, elided, connector = tree_prefixes(branches, width, has_children)
+        if not branches:
+            print('\n' + '-' * width)
+        else:
+            print(connector)
+        if row is None:
+            label = 'Parent session'
+        else:
+            _, _, metadata, _ = row
+            agent_path = metadata['details'].get('agent_path', '/root')
+            label = safe_text(agent_path)
+            if agent_path == '/root' and not metadata['details'].get('parent_thread_id'):
+                cwd = metadata.get('cwd', '')
+                project = '~' if cwd == str(Path.home()) else ntpath.basename(cwd.rstrip('/\\')) or 'session'
+                label = f'{safe_text(project)} | {label}'
+        if expanded:
+            label += f' [{safe_text(node)[-8:]}]'
+        if row is None:
+            label += ' (parent summary unavailable)'
+        if selected:
+            index += 1
+            when, path, metadata, texts = row
+            active = metadata['active']
+            context = metadata['details'].get('current_context' if active else 'summary_context', {})
+            model = context.get('model', '')
+            effort = context.get('reasoning_effort')
+            model_effort = model + (f'/{effort}' if effort else '')
+            if model_effort:
+                label += f' | {safe_text(model_effort)}'
+            if active:
+                label += ' | active'
+            label = f'{index}. {label} | {clock_label(when)} ({age_label(when, now)})'
+        elif row is not None:
+            label += ' (parent context)'
+        if elided:
+            label = f'(depth {len(branches)}) {label}'
+        print(textwrap.fill(label, width=width, initial_indent=heading_prefix,
+                            subsequent_indent=prefix))
+        if not selected:
+            continue
+        render_details(metadata['details'], width, expanded, prefix, active)
+        if not texts:
+            print(prefix.rstrip())
+            print(textwrap.fill('No saved reasoning summary yet.', width=width,
+                                initial_indent=prefix + '    ',
+                                subsequent_indent=prefix + '    '))
+            continue
+        summary_when = parse_timestamp(metadata['summary_timestamp'])
+        if active and summary_when is not None:
+            print(prefix.rstrip())
+            print(textwrap.fill(f'Latest summary: {clock_label(summary_when)} '
+                                f'({age_label(summary_when, now)})', width=width,
+                                initial_indent=prefix + '  ',
+                                subsequent_indent=prefix + '  '))
+        text = safe_text('\n\n'.join(texts))
+        for paragraph in re.split(r'\n\s*\n', text.strip()):
+            heading = re.fullmatch(r'\*\*(.+?)\*\*', paragraph.strip())
+            indent = prefix + ('  ' if heading else '    ')
+            content = heading.group(1) if heading else ' '.join(paragraph.split())
+            print(prefix.rstrip())
+            print(textwrap.fill(content, width=width, initial_indent=indent,
+                                subsequent_indent=indent, break_long_words=True,
+                                break_on_hyphens=False))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+epilog='''Examples:
+  codex-reasoning --max-age 15
+  watch -n 2 codex-reasoning
+  codex-reasoning -a 5
+  codex-reasoning --codex-home ~/.codex-work --width 80
+  codex-reasoning --details
+  codex-reasoning --json | jq '.[].summary[]'
+
+Install (Linux/macOS, Python 3.9+):
+  mkdir -p ~/.local/bin
+  install -m 755 codex-reasoning ~/.local/bin/codex-reasoning
+  Add ~/.local/bin to PATH if needed. Or run: python3 codex-reasoning
+  Windows: py -3 codex-reasoning (watch is an optional external command).
+
+Reads CODEX_HOME/sessions (default: ~/.codex/sessions); an empty CODEX_HOME
+uses the default. No network access or log/config changes. By default, only
+agents whose latest recorded turn is started and whose log was recently written
+are shown, even without reasoning. -a also shows up to count recent finished
+sessions with saved reasoning. Saved summaries depend on the model and Codex
+settings. A started turn is a log signal, not a live process check.
+Text output identifies agents by their /subagents paths and groups them under
+their recorded parents. Without -a, inactive ancestor headings are omitted.
+With -a, extra ancestor headings provide context without displaying older
+summaries. Agents at every tree level stay ordered by session start time,
+newest first.
+Deep ancestry is elided to fit the width and marked with its actual depth.
+Copied logs must retain recent modification times to appear. Naive timestamps
+are interpreted as UTC. --json emits a flat newest-first array with session_id,
+cwd, agent_nickname, active, activity_timestamp, timestamp (summary time or
+null), and summary (text array); --details adds a details object. JSON preserves
+source text; terminal output removes controls. Model/effort/mode describe the
+current turn for active agents and the displayed summary's turn otherwise.
+Details include agent ancestry, branch at session start, latest recorded turn
+event, and latest token report, when available. Cached input and reasoning output
+are subsets of input and output counts; cumulative totals count repeated requests,
+not unique context or cost. Missing fields are omitted. No matches succeeds;
+missing/unreadable directories exit 1, invalid arguments exit 2.
+''')
+    parser.add_argument('count', nargs='?', type=int, default=5,
+                        help='number of recent finished sessions to add with -a (default: 5; active agents always shown)')
+    parser.add_argument('-a', '--all', action='store_true',
+                        help='also show recent finished sessions with saved reasoning')
+    parser.add_argument('--max-age', type=float, default=60, metavar='MINUTES',
+                        help='maximum age of summaries and log activity (positive, finite; default: 60)')
+    parser.add_argument('--codex-home', type=Path, metavar='PATH',
+                        help='Codex data directory; overrides CODEX_HOME')
+    parser.add_argument('--width', type=int, metavar='COLUMNS',
+                        help='text wrapping width, 20-1000 (default: terminal, capped at 100)')
+    parser.add_argument('--json', action='store_true', help='emit JSON instead of terminal text')
+    parser.add_argument('--details', action='store_true',
+                        help='include session IDs, agent ancestry, turn events, branch, and token usage')
+    parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
+    args = parser.parse_args(argv)
+    if args.count < 1:
+        parser.error('count must be at least 1')
+    if not math.isfinite(args.max_age) or args.max_age <= 0:
+        parser.error('--max-age must be a positive, finite number of minutes')
+    if args.width is not None and not 20 <= args.width <= 1000:
+        parser.error('--width must be between 20 and 1000')
+    now = datetime.now(UTC)
+    try:
+        cutoff = now - timedelta(minutes=args.max_age)
+    except OverflowError:
+        parser.error('--max-age is too large')
+    try:
+        home = args.codex_home or Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex')
+        available = collect_sessions(home.expanduser() / 'sessions', cutoff)
+        sessions = select_sessions(available, cutoff, args.count, args.all)
+    except (OSError, RuntimeError) as error:
+        print(f'codex-reasoning: {safe_text(str(error))}', file=sys.stderr)
+        print('Run Codex to create sessions, or select a data directory with --codex-home.',
+              file=sys.stderr)
+        return 1
+    if args.json:
+        entries = [dict(session_id=meta.get('id') or path.stem, cwd=meta.get('cwd', ''),
+                        agent_nickname=meta.get('agent_nickname'),
+                        active=meta['active'], activity_timestamp=meta['activity_timestamp'],
+                        timestamp=meta['summary_timestamp'], summary=texts)
+                   for _, path, meta, texts in sessions]
+        if args.details:
+            for entry, (_, _, metadata, _) in zip(entries, sessions):
+                entry['details'] = metadata['details']
+        print(json.dumps(entries, indent=2))
+    else:
+        render_text(sessions, now, args.max_age, args.width or terminal_width(),
+                    args.details, available, args.all)
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        if hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(errors='replace')
+        try:
+            status = main()
+        except SystemExit as error:
+            status = error.code
+        sys.stdout.flush()
+    except (BrokenPipeError, KeyboardInterrupt) as error:
+        # Discard pending output so shutdown cannot block or flush a closed pipe.
+        with open(os.devnull, 'w') as sink:
+            os.dup2(sink.fileno(), sys.stdout.fileno())
+        status = 130 if isinstance(error, KeyboardInterrupt) else 0
+    sys.exit(status)
