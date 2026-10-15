@@ -71,12 +71,11 @@ git clone https://github.com/Midgaze/codex-reasoning.git
 cd codex-reasoning
 ```
 
-To have edits take effect immediately, symlink the script into a directory on
-your `PATH`. For example, if you use `~/bin`:
+To have edits take effect immediately, symlink the script into `~/.local/bin`:
 
 ```sh
-mkdir -p ~/bin
-ln -s "$PWD/codex-reasoning" ~/bin/reasoning
+mkdir -p ~/.local/bin
+ln -s "$PWD/codex-reasoning" ~/.local/bin/reasoning
 ```
 
 The destination must not already exist when creating the symlink. If you
