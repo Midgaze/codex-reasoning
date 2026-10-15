@@ -6,14 +6,25 @@ uses only the standard library.
 
 ## Install
 
+On Linux or macOS, download the script and install it as `reasoning`:
+
 ```sh
-git clone https://github.com/Midgaze/codex-reasoning.git
-cd codex-reasoning
+curl -fL https://raw.githubusercontent.com/Midgaze/codex-reasoning/main/codex-reasoning -o codex-reasoning
 mkdir -p ~/.local/bin
-install -m 755 codex-reasoning ~/.local/bin/codex-reasoning
+install -m 755 codex-reasoning ~/.local/bin/reasoning
 ```
 
-Ensure `~/.local/bin` is on your `PATH`. You can also run the script directly:
+Ensure `~/.local/bin` is on your `PATH`, then run `reasoning --help`. If needed,
+add this line to your shell's startup file (for example, `~/.bashrc` or `~/.zshrc`):
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+You can delete the downloaded file after installation. Repeat the download and
+install commands to update to the latest version.
+
+Alternatively, run the downloaded script directly:
 
 ```sh
 python3 codex-reasoning --help
@@ -24,16 +35,16 @@ On Windows, use `py -3 codex-reasoning`.
 ## Usage
 
 ```sh
-codex-reasoning                         # Active agents with recent log activity
-codex-reasoning -a 5                    # Also show up to five recent finished sessions
-codex-reasoning --max-age 15             # Limit activity and summaries to 15 minutes
-codex-reasoning --details               # Include ancestry, turn events, and token usage
-codex-reasoning --json                  # Emit a flat JSON array
-codex-reasoning --codex-home ~/.codex-work --width 80
-watch -n 2 codex-reasoning               # Refresh every two seconds; requires watch
+reasoning                         # Active agents with recent log activity
+reasoning -a 5                    # Also show up to five recent finished sessions
+reasoning --max-age 15             # Limit activity and summaries to 15 minutes
+reasoning --details               # Include ancestry, turn events, and token usage
+reasoning --json                  # Emit a flat JSON array
+reasoning --codex-home ~/.codex-work --width 80
+watch -n 2 reasoning               # Refresh every two seconds; requires watch
 ```
 
-Run `codex-reasoning --help` for all options and output details.
+Run `reasoning --help` for all options and output details.
 
 The tool reads `$CODEX_HOME/sessions`, defaulting to `~/.codex/sessions`.
 `--codex-home` overrides that location. The default activity window is 60 minutes.
@@ -52,12 +63,22 @@ unreadable session directories, and `2` for invalid arguments.
 
 ## Local development
 
-The repository contains the executable script directly, with no build step or
-dependencies. To have edits take effect immediately, symlink it onto your `PATH`
-instead of installing a copy:
+Clone the repository wherever you keep source code. There is no build step or
+dependency installation:
 
 ```sh
-ln -s "$PWD/codex-reasoning" ~/.local/bin/codex-reasoning
+git clone https://github.com/Midgaze/codex-reasoning.git
+cd codex-reasoning
 ```
 
-The destination must not already exist when creating the symlink.
+To have edits take effect immediately, symlink the script into a directory on
+your `PATH`. For example, if you use `~/bin`:
+
+```sh
+mkdir -p ~/bin
+ln -s "$PWD/codex-reasoning" ~/bin/reasoning
+```
+
+The destination must not already exist when creating the symlink. If you
+previously installed a copy elsewhere on your `PATH`, remove it or ensure the
+symlink's directory comes first. Use `git pull` in the checkout to update.
